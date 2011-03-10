@@ -1,0 +1,5 @@
+.libs/
+mod_git.la
+mod_git.lo
+mod_git.o
+mod_git.slo
