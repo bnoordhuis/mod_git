@@ -4,9 +4,9 @@
 ##
 
 builddir=.
-top_srcdir=
-top_builddir=/usr/share/apache2
-include /usr/share/apache2/build/special.mk
+top_srcdir=/home/bnoordhuis/opt/httpd
+top_builddir=/home/bnoordhuis/opt/httpd
+include /home/bnoordhuis/opt/httpd/build/special.mk
 
 #   the used tools
 APXS=apxs
@@ -16,6 +16,9 @@ APACHECTL=apachectl
 #DEFS=-Dmy_define=my_value
 #INCLUDES=-Imy/include/dir
 #LIBS=-Lmy/lib/dir -lmylib
+INCLUDES=-I/home/bnoordhuis/src/libgit2/include
+LDFLAGS=-L/home/bnoordhuis/src/libgit2/build/static -lgit2
+EXTRA_LDFLAGS=$(LDFLAGS)
 
 #   the default target
 all: local-shared-build

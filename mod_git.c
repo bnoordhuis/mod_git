@@ -53,7 +53,7 @@ static int mod_git_handler(request_rec *r) {
 	const char *refname;
 	const char *content;
 	mod_git_dconf *dc;
-	int rv, status;
+	int rv, status, size;
 
 	dc = ap_get_module_config(r->per_dir_config, &git_module);
 
@@ -157,9 +157,24 @@ static int mod_git_handler(request_rec *r) {
 		goto cleanup;
 	}
 
-	content = git_blob_rawcontent(blob);
-	if (content != NULL) {
-		ap_rwrite(content, git_blob_rawsize(blob), r);
+	/* TODO look up content type */
+	ap_set_content_type(r, "text/plain");
+
+	size = git_blob_rawsize(blob);
+
+	if (r->header_only) {
+		ap_set_content_length(r, size);
+	}
+	else {
+		content = git_blob_rawcontent(blob);
+		if (content == NULL) {
+			/* defense in depth, this should never happen */
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_blob_rawcontent(%s): %s",
+					oid2str(r, oid), git_strerror(status));
+		}
+		else {
+			ap_rwrite(content, size, r);
+		}
 	}
 
 	rv = OK;
