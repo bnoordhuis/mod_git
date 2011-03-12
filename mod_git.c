@@ -5,6 +5,8 @@
 #include "http_protocol.h"
 #include "ap_config.h"
 
+#include "apr_strings.h"
+
 #include "git2.h"
 
 /* per-directory config */
@@ -14,7 +16,138 @@ typedef struct {
 	const char *ref;
 } mod_git_dconf;
 
+/* per-request config */
+typedef struct {
+	git_repository *repo;
+	const git_oid *oid;       /* OID of the object this request points to */
+	int status_code;          /* HTTP status code to return in the handler */
+	const char *filename;
+	apr_filetype_e filetype;
+} mod_git_rconf;
+
 module AP_MODULE_DECLARE_DATA git_module;
+
+static const char *oid2str(request_rec *r, const git_oid *oid) {
+	char *buf = apr_palloc(r->pool, GIT_OID_HEXSZ + 1);
+	git_oid_to_string(buf, GIT_OID_HEXSZ + 1, oid);
+	return buf;
+}
+
+static apr_status_t rconf_cleanup(void *arg) {
+	mod_git_rconf *rc = arg;
+	git_repository_free(rc->repo);
+	return APR_SUCCESS;
+}
+
+static mod_git_rconf *find_object(request_rec *r) {
+	const git_oid *oid;
+	git_reference *ref;
+	git_tree *tree;
+	git_tree_entry *entry;
+	git_object *obj;
+	git_blob *blob;
+	const char *refname;
+	int status, size;
+	mod_git_dconf *dc;
+	mod_git_rconf *rc;
+
+	dc = ap_get_module_config(r->per_dir_config, &git_module);
+	if (dc->path == NULL) {
+		return NULL;
+	}
+
+	rc = apr_pcalloc(r->pool, sizeof *rc);
+	rc->status_code = HTTP_INTERNAL_SERVER_ERROR;
+	rc->filetype = APR_NOFILE;
+	apr_pool_cleanup_register(r->pool, rc, rconf_cleanup, NULL);
+
+	status = git_repository_open(&rc->repo, dc->path);
+	if (status < 0) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_repository_open(%s): %s", dc->path, git_strerror(status));
+		return rc;
+	}
+
+	/* TODO resolve short branch/tag names */
+	refname = dc->ref ? dc->ref : "refs/heads/master";
+
+	status = git_reference_lookup(&ref, rc->repo, refname);
+	if (status < 0) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_reference_lookup(%s): %s", refname, git_strerror(status));
+		return rc;
+	}
+
+	oid = git_reference_oid(ref);
+	if (oid == NULL) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_reference_oid(%s): not an OID", refname);
+		return rc;
+	}
+
+	rc->filename = r->uri + dc->prefix_len;
+	rc->filetype = APR_REG;
+
+	if (rc->filename[0] == '/') {
+		rc->filename++;
+	}
+
+	if (rc->filename[0] == '\0') {
+		rc->filetype = APR_DIR;
+		return rc;
+	}
+
+	status = git_object_lookup(&obj, rc->repo, oid, GIT_OBJ_ANY);
+	if (status < 0) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_object_lookup(%s): %s",
+				oid2str(r, oid), git_strerror(status));
+		return rc;
+	}
+
+	switch (git_object_type(obj)) {
+	case GIT_OBJ_COMMIT:
+		{
+			git_commit *commit = NULL;
+
+			status = git_commit_lookup(&commit, rc->repo, git_object_id(obj));
+			if (status < 0) {
+				ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_commit_lookup(%s): %s",
+						oid2str(r, git_object_id(obj)), git_strerror(status));
+				return rc;
+			}
+
+			/* cast away constness, the git_tree_* functions only accept mutable trees */
+			tree = (git_tree *) git_commit_tree(commit);
+		}
+		break;
+
+	default:
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "%s objects not yet supported",
+				git_object_type2string(git_object_type(obj)));
+		return rc;
+	}
+
+	if (tree == NULL) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "no matching tree");
+		return rc;
+	}
+
+	entry = git_tree_entry_byname(tree, rc->filename);
+	if (entry == NULL) {
+		rc->status_code = HTTP_NOT_FOUND;
+		rc->filetype = APR_NOFILE;
+		return rc;
+	}
+
+	status = git_tree_entry_2object(&obj, entry);
+	if (status < 0) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_tree_entry_2object(%s): %s",
+				git_tree_entry_name(entry), git_strerror(status));
+		return rc;
+	}
+
+	rc->oid = git_object_id(obj);
+	rc->status_code = OK;
+
+	return rc;
+}
 
 static void *mod_git_create_dir_config(apr_pool_t *p, char *path) {
 	mod_git_dconf *dc = apr_pcalloc(p, sizeof *dc);
@@ -36,129 +169,50 @@ static void *mod_git_merge_dir_config(apr_pool_t *p, void *basev, void *addv) {
 	return dc;
 }
 
-static const char *oid2str(request_rec *r, const git_oid *oid) {
-	char *buf = apr_palloc(r->pool, GIT_OID_HEXSZ + 1);
-	git_oid_to_string(buf, GIT_OID_HEXSZ + 1, oid);
-	return buf;
+static int mod_git_translate_name(request_rec *r) {
+	mod_git_rconf *rc;
+
+	rc = find_object(r);
+	if (rc == NULL) {
+		ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "no mapping for %s", r->uri);
+		return DECLINED;
+	}
+	else {
+		ap_set_module_config(r->request_config, &git_module, rc);
+
+		/* this makes mod_dir and mod_mime perform their magic */
+		r->filename = apr_pstrdup(r->pool, rc->filename);
+		r->finfo.filetype = rc->filetype;
+
+		ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "%s mapped to %s", r->uri, r->filename);
+		return DECLINED;
+	}
 }
 
 static int mod_git_handler(request_rec *r) {
-	const git_oid *oid;
-	git_repository *repo;
-	git_reference *ref;
-	git_tree *tree;
-	git_tree_entry *entry;
-	git_object *obj;
+	const void *content;
+	int status, size;
 	git_blob *blob;
-	const char *refname;
-	const char *content;
-	mod_git_dconf *dc;
-	int rv, status, size;
+	mod_git_rconf *rc;
 
-	dc = ap_get_module_config(r->per_dir_config, &git_module);
+	rc = ap_get_module_config(r->request_config, &git_module);
 
-	if (dc->path == NULL) {
+	if (rc == NULL) {
 		return DECLINED;
 	}
 
-	repo = NULL;
-	ref  = NULL;
-	tree = NULL;
-	obj  = NULL;
-	blob = NULL;
+	ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "status_code == %d", rc->status_code);
 
-	rv = HTTP_INTERNAL_SERVER_ERROR;
-
-	status = git_repository_open(&repo, dc->path);
-	if (status < 0) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_repository_open(%s): %s", dc->path, git_strerror(status));
-		goto cleanup;
+	if (rc->status_code != OK) {
+		return rc->status_code;
 	}
 
-	/* TODO support short branch/tag names */
-	refname = dc->ref ? dc->ref : "refs/heads/master";
-
-	status = git_reference_lookup(&ref, repo, refname);
-	if (status < 0) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_reference_lookup(%s): %s", refname, git_strerror(status));
-		goto cleanup;
-	}
-
-	oid = git_reference_oid(ref);
-	if (oid == NULL) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_reference_oid(%s): not an OID", refname);
-		goto cleanup;
-	}
-
-	const char *filename = r->uri + dc->prefix_len;
-
-	if (filename[0] == '/') {
-		filename++;
-	}
-
-	if (filename[0] == '\0') {
-		filename = "index.html";
-	}
-
-	status = git_object_lookup(&obj, repo, oid, GIT_OBJ_ANY);
-	if (status < 0) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_object_lookup(%s): %s",
-				oid2str(r, oid), git_strerror(status));
-		goto cleanup;
-	}
-
-	switch (git_object_type(obj)) {
-	case GIT_OBJ_COMMIT:
-		{
-			git_commit *commit = NULL;
-
-			status = git_commit_lookup(&commit, repo, git_object_id(obj));
-			if (status < 0) {
-				ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_commit_lookup(%s): %s",
-						oid2str(r, git_object_id(obj)), git_strerror(status));
-				goto cleanup;
-			}
-
-			/* cast away constness, the git_tree_* functions only accept mutable trees */
-			tree = (git_tree *) git_commit_tree(commit);
-		}
-		break;
-
-	default:
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "%s objects not yet supported",
-				git_object_type2string(git_object_type(obj)));
-		goto cleanup;
-	}
-
-	if (tree == NULL) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "no matching tree");
-		goto cleanup;
-	}
-
-	entry = git_tree_entry_byname(tree, filename);
-	if (entry == NULL) {
-		rv = HTTP_NOT_FOUND;
-		goto cleanup;
-	}
-
-	status = git_tree_entry_2object(&obj, entry);
-	if (status < 0) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_tree_entry_2object(%s): %s",
-				git_tree_entry_name(entry), git_strerror(status));
-		goto cleanup;
-	}
-
-	oid = git_object_id(obj);
-
-	status = git_blob_lookup(&blob, repo, oid);
+	status = git_blob_lookup(&blob, rc->repo, rc->oid);
 	if (status < 0) {
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_blob_lookup(%s): %s",
-				oid2str(r, oid), git_strerror(status));
-		goto cleanup;
+				oid2str(r, rc->oid), git_strerror(status));
+		return HTTP_INTERNAL_SERVER_ERROR;
 	}
-
-	/* TODO look up content type */
-	ap_set_content_type(r, "text/plain");
 
 	size = git_blob_rawsize(blob);
 
@@ -170,24 +224,19 @@ static int mod_git_handler(request_rec *r) {
 		if (content == NULL) {
 			/* defense in depth, this should never happen */
 			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_blob_rawcontent(%s): %s",
-					oid2str(r, oid), git_strerror(status));
+					oid2str(r, rc->oid), git_strerror(status));
+			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 		else {
 			ap_rwrite(content, size, r);
 		}
 	}
 
-	rv = OK;
-
-cleanup:
-	if (repo != NULL) {
-		git_repository_free(repo);
-	}
-
-	return rv;
+	return OK;
 }
 
 static void mod_git_register_hooks(apr_pool_t *p) {
+	ap_hook_translate_name(mod_git_translate_name, NULL, NULL, APR_HOOK_MIDDLE);
 	ap_hook_handler(mod_git_handler, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
@@ -215,3 +264,7 @@ module AP_MODULE_DECLARE_DATA git_module = {
 	mod_git_cmds,
 	mod_git_register_hooks
 };
+
+#ifdef APLOG_USE_MODULE
+APLOG_USE_MODULE(git);
+#endif
