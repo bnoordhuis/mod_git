@@ -28,9 +28,14 @@ typedef struct {
 module AP_MODULE_DECLARE_DATA git_module;
 
 static const char *oid2str(request_rec *r, const git_oid *oid) {
-	char *buf = apr_palloc(r->pool, GIT_OID_HEXSZ + 1);
-	git_oid_to_string(buf, GIT_OID_HEXSZ + 1, oid);
-	return buf;
+	if (oid == NULL) {
+		return "(null)";
+	}
+	else {
+		char *buf = apr_palloc(r->pool, GIT_OID_HEXSZ + 1);
+		git_oid_to_string(buf, GIT_OID_HEXSZ + 1, oid);
+		return buf;
+	}
 }
 
 static apr_status_t rconf_cleanup(void *arg) {
@@ -113,8 +118,12 @@ static mod_git_rconf *find_object(request_rec *r) {
 				return rc;
 			}
 
-			/* cast away constness, the git_tree_* functions only accept mutable trees */
-			tree = (git_tree *) git_commit_tree(commit);
+			status = git_commit_tree(&tree, commit);
+			if (status < 0) {
+				ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "git_commit_tree(%s): %s",
+						oid2str(r, git_commit_id(commit)), git_strerror(status));
+				return rc;
+			}
 		}
 		break;
 
